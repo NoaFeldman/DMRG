@@ -13,6 +13,7 @@
 // Smarter krons (use block in matrices)
 // Smarter matrix multiplication (for example when I know one matrix is kroned with identity)
 // Pack matrices
+// Upate operators smarter
 
 typedef struct { float re, im; } fcomplex;
 
@@ -35,19 +36,17 @@ void cgesvd_( char* jobu, char* jobvt, int* m, int* n, fcomplex* a,
 
 // Global consts TODO static these
 const int D = 50;
-const int siteStatesNum = 2;
-const fcomplex sPlusSite[2*2] = {
+const int SITES_STATE_NUM = 2;
+const fcomplex S_PLUS_SITE[2*2] = {
 	{0, 0}, {1, 0},
 	{0, 0}, {0, 0}
 };
-const fcomplex sZSite[2*2] = {
+const fcomplex S_Z_SITE[2*2] = {
 	{1, 0}, {0, 0},
 	{0, 0}, {-1, 0}
 };
 const fcomplex h = {.re = 1, .im = 0}, j = {.re = 1, .im = 0} , jz = {.re = 1, .im = 0};
-const fcomplex one = {.re = 1, .im = 0}, zero = {.re = 0, .im = 0};
-char* nJobV = "N";
-char* jobV = "Vectors";
+const fcomplex ONE = {.re = 1, .im = 0}, ZERO = {.re = 0, .im = 0};
 
 typedef struct{
 	int elementsNum;
@@ -79,7 +78,7 @@ int getArraySize(int rowsNum, int colsNum) {
 	return rowsNum * colsNum;
 }
 
-// Returns the Kronecker product of A and B.
+// Returns the KrONEcker product of A and B.
 // [a11 * B a12*B ...]
 // [a21 * B ...      ]
 // Allocates the function!
@@ -87,7 +86,7 @@ fcomplex* kron(const fcomplex* restrict A, const fcomplex* restrict B, int rowsN
 	int rowsNum = rowsNumA * rowsNumB, colsNum = colsNumA * colsNumB;
 	int resultSize =  getArraySize(rowsNum, colsNum);
 	fcomplex* result = (fcomplex*) malloc(sizeof(fcomplex) * resultSize);
-	for (int i = 0; i < resultSize; i++) result[i] = one;
+	for (int i = 0; i < resultSize; i++) result[i] = ONE;
 	for (int i = 0; i < resultSize; i++) {
 		int row, col;
 		getEntryIndices(i, rowsNum, colsNum, &row, &col);
@@ -115,12 +114,12 @@ fcomplex* updateOperatorForNewBasis(fcomplex* basis, int newBasisSize, fcomplex*
 // TOO multiply by h, j , jz
 Block * initBlock() {
 	Block* result = (Block*) malloc(sizeof(Block));
-	fcomplex* sPlus = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
-	memcpy(sPlus, sPlusSite, sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
-	fcomplex* sZ = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
-	memcpy(sZ, sZSite, sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
-	fcomplex* H = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
-	memcpy(H, sZSite, sizeof(fcomplex) * getArraySize(siteStatesNum, siteStatesNum));
+	fcomplex* sPlus = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
+	memcpy(sPlus, S_PLUS_SITE, sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
+	fcomplex* sZ = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
+	memcpy(sZ, S_Z_SITE, sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
+	fcomplex* H = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
+	memcpy(H, S_Z_SITE, sizeof(fcomplex) * getArraySize(SITES_STATE_NUM, SITES_STATE_NUM));
 	result->elementsNum = 1;
 	result->basisSize = 2;
 	result->sPlusLastSite = sPlus;
@@ -157,9 +156,9 @@ fcomplex* identity(int n) {
 		int row, col;
 		getEntryIndices(i, n, n, &row, &col);
 		if (row == col) {
-			result[i] = one;
+			result[i] = ONE;
 		} else {
-			result[i] = zero;
+			result[i] = ZERO;
 		}
 	}
 	return result;
@@ -169,17 +168,17 @@ fcomplex* identity(int n) {
 void updateBlockHForNewSite(Block* block, fcomplex* H, fcomplex* sPlusNewSite, fcomplex* sZNewSite, int blockStatesNum) {
 	// cgemm assigns C = alpha * AB + beta * C
 	// todo better way for this?
-	fcomplex* I = identity(siteStatesNum);
-	fcomplex* expandedSPlusLastSite = kron(I, block->sPlusLastSite, siteStatesNum, siteStatesNum, block->basisSize, block->basisSize);
-	fcomplex* expandedSZLastSite = kron(I, block->sZLastSite, siteStatesNum, siteStatesNum, block->basisSize, block->basisSize);
+	fcomplex* I = identity(SITES_STATE_NUM);
+	fcomplex* expandedSPlusLastSite = kron(I, block->sPlusLastSite, SITES_STATE_NUM, SITES_STATE_NUM, block->basisSize, block->basisSize);
+	fcomplex* expandedSZLastSite = kron(I, block->sZLastSite, SITES_STATE_NUM, SITES_STATE_NUM, block->basisSize, block->basisSize);
 	free(I);
 
 	cgemm_("N", "T", &blockStatesNum, &blockStatesNum, &blockStatesNum, &j, expandedSPlusLastSite, &blockStatesNum, 
-		sPlusNewSite, &blockStatesNum, &one, H, &blockStatesNum);	
+		sPlusNewSite, &blockStatesNum, &ONE, H, &blockStatesNum);	
 	cgemm_("T", "N", &blockStatesNum, &blockStatesNum, &blockStatesNum, &j, expandedSPlusLastSite, &blockStatesNum, 
-		sPlusNewSite, &blockStatesNum, &one, H, &blockStatesNum);	
+		sPlusNewSite, &blockStatesNum, &ONE, H, &blockStatesNum);	
 	cgemm_("N", "T", &blockStatesNum, &blockStatesNum, &blockStatesNum, &j, expandedSZLastSite, &blockStatesNum, 
-		sZNewSite, &blockStatesNum, &one, H, &blockStatesNum);	
+		sZNewSite, &blockStatesNum, &ONE, H, &blockStatesNum);	
 	free(expandedSZLastSite);
 	free(expandedSPlusLastSite);
 }
@@ -198,11 +197,11 @@ fcomplex* getFullH(fcomplex* H_A, fcomplex* sPlusNewSite, fcomplex* sZNewSite, i
 	fcomplex* sZA = kron(sZNewSite, I, blockStatesNum, blockStatesNum, blockStatesNum, blockStatesNum);
 	fcomplex* sZB = kron(I, sZNewSite, blockStatesNum, blockStatesNum, blockStatesNum, blockStatesNum);
 	cgemm_("N", "T", &fullStatesNum, &fullStatesNum, &fullStatesNum, &j, 
-		sPlusA, &fullStatesNum, sPlusB, &fullStatesNum, &one, fullH, &fullStatesNum);	
+		sPlusA, &fullStatesNum, sPlusB, &fullStatesNum, &ONE, fullH, &fullStatesNum);	
 	cgemm_("T", "N", &fullStatesNum, &fullStatesNum, &fullStatesNum, &j, 
-		sPlusA, &fullStatesNum, sPlusB, &fullStatesNum, &one, fullH, &fullStatesNum);	
+		sPlusA, &fullStatesNum, sPlusB, &fullStatesNum, &ONE, fullH, &fullStatesNum);	
 	cgemm_("N", "N", &fullStatesNum, &fullStatesNum, &fullStatesNum, &jz, 
-		sZA, &fullStatesNum, sZB, &fullStatesNum, &one, fullH, &fullStatesNum);	
+		sZA, &fullStatesNum, sZB, &fullStatesNum, &ONE, fullH, &fullStatesNum);	
 	free(I);
 	free(sPlusA);
 	free(sPlusB);
@@ -247,9 +246,9 @@ fcomplex* getGroundState(fcomplex* H, int statesNum) {
 // psi* psi^dagger is our density matrix.
 fcomplex* getReducedDensityMatrix(fcomplex* groundState, int blockStatesNum) {
 	fcomplex* rhoA = (fcomplex*) malloc(sizeof(fcomplex) * getArraySize(blockStatesNum, blockStatesNum));
-	cgemm_("N", "T", &blockStatesNum, &blockStatesNum, &blockStatesNum, &one, 
+	cgemm_("N", "T", &blockStatesNum, &blockStatesNum, &blockStatesNum, &ONE, 
 		groundState, &blockStatesNum, groundState, &blockStatesNum, 
-		&zero, rhoA, &blockStatesNum);	
+		&ZERO, rhoA, &blockStatesNum);	
 	return rhoA;
 }
 
@@ -287,40 +286,40 @@ fcomplex* getNewBasis(fcomplex* psi, int blockStatesNum, int* newBasisSize) {
     return U;
 }
 
-// TOO bugge
+// TODO bugged
 fcomplex* updateOperatorForNewBasis(fcomplex* basis, int newBasisSize, fcomplex* O, int oldBasisSize) {
-	// printMatrix("basis", basis, oldBasisSize, newBasisSize);
+	printMatrix("basis", basis, oldBasisSize, newBasisSize);
 	printMatrix("basis", basis, newBasisSize, oldBasisSize);
 	printMatrix("O", O, oldBasisSize, oldBasisSize);
 
 	fcomplex* result = (fcomplex* ) malloc(sizeof(fcomplex) * getArraySize(newBasisSize, newBasisSize));
 	fcomplex* temp = (fcomplex* ) malloc(sizeof(fcomplex) * getArraySize(oldBasisSize, newBasisSize));
 
- 	cgemm_("N", "N", &newBasisSize, &oldBasisSize, &oldBasisSize, &one,
-		O, &oldBasisSize, basis, &oldBasisSize,  
-		&zero, temp, &newBasisSize);
+ 	cgemm_("N", "N", &newBasisSize, &oldBasisSize, &oldBasisSize, &ONE,
+		basis, &oldBasisSize, O, &oldBasisSize,
+		&ZERO, temp, &newBasisSize);
 	printMatrix("temp", temp, oldBasisSize, newBasisSize);
 	// printMatrix("temp", temp, newBasisSize, oldBasisSize);
  
- //  	cgemm_("N", "T", &oldBasisSize, &newBasisSize, &oldBasisSize, &one,
+ //  	cgemm_("N", "T", &oldBasisSize, &newBasisSize, &oldBasisSize, &ONE,
 	// 	O, &oldBasisSize, basis, &newBasisSize, 
-	// 	&zero, temp, &oldBasisSize);
+	// 	&ZERO, temp, &oldBasisSize);
 	// printMatrix("temp", temp, oldBasisSize, newBasisSize);
-	// cgemm_("N", "N", &newBasisSize, &newBasisSize, &oldBasisSize, &one, basis, &newBasisSize, 
-	// 	temp, &oldBasisSize, &zero, result, &newBasisSize);		
+	// cgemm_("N", "N", &newBasisSize, &newBasisSize, &oldBasisSize, &ONE, basis, &newBasisSize, 
+	// 	temp, &oldBasisSize, &ZERO, result, &newBasisSize);		
 	// printMatrix("res", result, newBasisSize, newBasisSize);
 	free(temp);
 	return result;
 }
 
 Block* dmrgStep(Block* block) {
-	int blockStatesNum = block->basisSize * siteStatesNum;
+	int blockStatesNum = block->basisSize * SITES_STATE_NUM;
 	
 	fcomplex* I_block = identity(block->basisSize);
- 	fcomplex* I_site = identity(siteStatesNum); 
-	fcomplex* sPlusNewSite = kron(sPlusSite, I_block, siteStatesNum, siteStatesNum, block->basisSize, block->basisSize);
-	fcomplex* sZNewSite = kron(sZSite, I_block, siteStatesNum, siteStatesNum, block->basisSize, block->basisSize);
-	fcomplex* expandedH = kron(I_site, block->H, siteStatesNum, siteStatesNum, block->basisSize, block->basisSize);
+ 	fcomplex* I_site = identity(SITES_STATE_NUM); 
+	fcomplex* sPlusNewSite = kron(S_PLUS_SITE, I_block, SITES_STATE_NUM, SITES_STATE_NUM, block->basisSize, block->basisSize);
+	fcomplex* sZNewSite = kron(S_Z_SITE, I_block, SITES_STATE_NUM, SITES_STATE_NUM, block->basisSize, block->basisSize);
+	fcomplex* expandedH = kron(I_site, block->H, SITES_STATE_NUM, SITES_STATE_NUM, block->basisSize, block->basisSize);
 	free(I_block);
 	free(I_site);
 
