@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h> 
 #include <unistd.h> 
+#include <time.h>
+
+#define LATTICE_SIZE 14
+#define D 50
+#define SITE_STATES_NUM 2
+
 // TODO
 // Smarter krons (use matrixBlock in matrices)
 // Smarter matrix multiplication (for example when I know one matrix is kroned with identity)
@@ -51,6 +57,7 @@ typedef struct {
  	fcomplex* sZLastSite;
 	fcomplex* H;
 	float sZ;
+	float E0;
 } MatrixBlock;
 
 // After combining two lattice blocks, A and B, into one, we keep track of which A and B matrix blocks created each 
@@ -67,9 +74,7 @@ typedef struct {
 } BlockStatesDoc;
 
 // Global consts TODO static these
-const int D = 25;
-const int SITE_STATES_NUM = 2;
-const fcomplex M = {.re = 0, .im = 0}, JPM = {.re = 1, .im = 0} , JZ = {.re = 1, .im = 0};
+const fcomplex M = {.re = 0, .im = 0}, JPM = {.re = 1, .im = 0} , JZ = {.re = 0, .im = 0};
 const fcomplex ONE = {.re = 1, .im = 0}, ZERO = {.re = 0, .im = 0};
 fcomplex S_PLUS_DOWN_STATE[1];
 fcomplex S_Z_DOWN_STATE[1];
@@ -127,6 +132,7 @@ void freeMatrixBlock(MatrixBlock* matrixBlock) {
 	freeFcomplexArr(matrixBlock->H);
 }
 
+void printMatrix(char* desc, fcomplex* M, int rowsNum, int colsNum);
 void printMatrixBlock(char* desc, MatrixBlock* M) {
 	printf("%s:\n", desc);
 	printf("elementsNum: %d\n", M->elementsNum);
@@ -179,7 +185,6 @@ void printBlockStatesDoc(char* desc, BlockStatesDoc* doc) {
 // ----------------------------------------------------------------------------------------------------------------
 
 void identity(fcomplex* result, int n);
-void printMatrix(char* desc, fcomplex* M, int rowsNum, int colsNum);
 void dagger(fcomplex* M, int rowsNum, int colsNum, fcomplex* result);
 void kron(const fcomplex* restrict A, const fcomplex* restrict B, 
 	int rowsNumA, int colsNumA, int rowsNumB, int colsNumB, fcomplex* result);
@@ -219,7 +224,7 @@ void cgesvd_( char* jobu, char* jobvt, int* m, int* n, fcomplex* a,
 
 // combines a block A with block B, assuming they share there sZ value.
 // Does not deal with sPlusLastSite member.
-void toSingleMatrixBlock(MatrixBlock* restrict A, MatrixBlock* restrict B, MatrixBlock* result);
+void toSingleMatrixBlock(MatrixBlock* restrict A, MatrixBlock* restrict B, MatrixBlock* result, char* combineMode);
 void copyMatrixBlock(MatrixBlock* source, MatrixBlock* dest);
 
 // ----------------------------------------------------------------------------------------------------------------
@@ -286,7 +291,7 @@ fcomplex* getsZLastSite(float sZ, int basisSize) {
 
 // Creates a block of A x B states, Does not add the S+- operators to the Hamiltonian.
 void combineStates(MatrixBlock* restrict A, int ABlocksNum, MatrixBlock* restrict B, int BBlocksNum, 
-		MatrixBlock** result, int* resultSize, BlockStatesDoc** doc) {
+		MatrixBlock** result, int* resultSize, BlockStatesDoc** doc, char* combineMode) {
 	MatrixBlock* blocks = mallocMatrixBlockArr(ABlocksNum * BBlocksNum);
 	int blocksCounter = 0;
 	*doc = mallocBlockStatesDocArr(ABlocksNum * BBlocksNum);
@@ -304,7 +309,13 @@ void combineStates(MatrixBlock* restrict A, int ABlocksNum, MatrixBlock* restric
 			kron(I_A, B[j].H, A[i].basisSize, A[i].basisSize, B[j].basisSize, B[j].basisSize, H_B);
 			fcomplex* H = mallocFcomplexArr(combinedArraySize);
 			for (int k = 0; k < combinedArraySize; k++) H[k] = add(H_A[k], H_B[k]);
-			fcomplex* sZLastSite = getsZLastSite(A[i].sZ, A[i].basisSize * B[j].basisSize); // This matrix will be used only if A is the new site, so we assume A[i] here is a single site.
+			fcomplex* sZLastSite;
+			if (*combineMode == 'f' || *combineMode == 'F') {
+				sZLastSite = NULL;
+			} else {
+				sZLastSite = getsZLastSite(A[i].sZ, A[i].basisSize * B[j].basisSize); 
+				// This matrix will be used only if A is the new site, so we assume A[i] here is a single site.
+			}
 			fcomplex sZsZ[getArraySize(combinedBasisSize, combinedBasisSize)]; 
 			kron(A[i].sZLastSite, B[j].sZLastSite, A[i].basisSize, A[i].basisSize, B[j].basisSize, B[j].basisSize, sZsZ);
 			for (int k = 0; k < combinedArraySize; k++) H[k] = add(H[k], mult(sZsZ[k], JZ));
@@ -326,7 +337,7 @@ void combineStates(MatrixBlock* restrict A, int ABlocksNum, MatrixBlock* restric
 					MatrixBlock oldBlock;
 					copyMatrixBlock(blocks + k, &oldBlock);
 					freeMatrixBlock(blocks + k);
-					toSingleMatrixBlock(&oldBlock, block, blocks + k);
+					toSingleMatrixBlock(&oldBlock, block, blocks + k, combineMode);
 					addSPMDonationToH(blocks + k, (*doc)[k], oldBlock.basisSize, A, i, B, j);
 
 					// Update our book keeping structs.
@@ -425,6 +436,11 @@ void getDensityMatrixEigenVectors(fcomplex* rhoA, int rhoADim, float** eigenvalu
 
 // Returns the eigenvector corresponding to the smallest eigenvalue of H, H is statesNum*statesNum.
 fcomplex* getGroundStateForBlock(fcomplex* H, int statesNum, float* groundStateEnergy) {
+	time_t start;
+    start = time(NULL);
+    time_t curr;
+	curr = time(NULL);
+
  	// cheev changes the matrix H, and we want to keep our H intact for later.
 	fcomplex* tempH = mallocFcomplexArr(pow(statesNum, 2));
 	memcpy(tempH, H, sizeof(fcomplex) * pow(statesNum, 2));
@@ -446,16 +462,18 @@ fcomplex* getGroundStateForBlock(fcomplex* H, int statesNum, float* groundStateE
        printf( "getGroundStateForBlock: cheev failed.\n" );
        exit(1);
     }
+
     *groundStateEnergy = eigenvalues[0];
     fcomplex* groundState = mallocFcomplexArr(statesNum);
 	memcpy(groundState, tempH, sizeof(fcomplex) * statesNum);
 	freeFcomplexArr(tempH);
     freeFcomplexArr(work);
+
 	return groundState;
 }
 
-void getGroundState(MatrixBlock* blocks, int blocksNum, BlockStatesDoc* docs, int* groundStateBlockIndex, fcomplex** groundState) {
-	// for (int i = 0; i < blocksNum; i++)printMatrixBlock("", &blocks[i]);
+void getGroundState(MatrixBlock* blocks, int blocksNum, BlockStatesDoc* docs, int* groundStateBlockIndex, fcomplex** groundState, float *E0) {
+		// for (int i = 0; i < blocksNum; i++)printMatrixBlock("", &blocks[i]);
 	float lowestEnergy;
 	fcomplex* bestVec;
 	int bestBlockIndex = 0;
@@ -469,34 +487,65 @@ void getGroundState(MatrixBlock* blocks, int blocksNum, BlockStatesDoc* docs, in
 			bestBlockIndex = i;
 		} else freeFcomplexArr(blockGroundState);
 	}
-	printf("E0 = %f\n", lowestEnergy);
+	*E0 = lowestEnergy;
 	*groundStateBlockIndex = bestBlockIndex;
 	*groundState = bestVec;
 }
 
-MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resultSize, int* resultBasisSize);
-
-void exact(int size);
+MatrixBlock* infiniteDmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resultSize, int* resultBasisSize);
+MatrixBlock* finiteDmrgStep(MatrixBlock* A, int ABlocksNum, MatrixBlock* B, int BBlocksNum, int* resultSize, int* resultBasisSize);
+MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, MatrixBlock* B, int BBlocksNum, int* resultSize, int* resultBasisSize);
+void exact();
 
 int main() {
+	fcomplex sp[] = {ZERO, ZERO};
+	fcomplex z[] = {ZERO};
+	MatrixBlock empty = {.elementsNum = 0, .basisSize = 1, .sPlusLastSite = sp, .nextBlockBasisSize = 2,
+ 		.sZLastSite = z, .H = z, .sZ = 0};
 	initSingleSite();
-	MatrixBlock* blocks = mallocMatrixBlockArr(2);
-	for (int i = 0; i < 2; i++) copyMatrixBlock(NEW_STATE_MATRIX_BLOCK + i, blocks + i);
+	MatrixBlock* currBlocks = mallocMatrixBlockArr(1);
+	copyMatrixBlock(&empty, currBlocks);
 
-	int nextStepBlocksNum = 2;
-	int nextStepBasisSize = 2;
-	for (int i = 0; i < 100; i++) {
-		printf("--------------------------------------------------------------------\n");
+	MatrixBlock* allBlocks[LATTICE_SIZE + 1];
+	int allBlocksNums[LATTICE_SIZE + 1];
+	allBlocks[0] = currBlocks;
+	allBlocksNums[0] = 1;
+	int nextStepBlocksNum = 1;
+	int nextStepBasisSize = 1;
+	int i;
+	for (i = 1; i <= LATTICE_SIZE / 2; i++) {
 		int thisStepBlocksNum = nextStepBlocksNum;
 		int thisStepBasisSize = nextStepBasisSize;
-		blocks = dmrgStep(blocks, thisStepBlocksNum, thisStepBasisSize, &nextStepBlocksNum, &nextStepBasisSize);
-		// exact((i + 2) * 2);
-		printf("nextStepBlocksNum = %d\n", nextStepBlocksNum);
-		// for (int j = 0; j < nextStepBlocksNum; j++) printMatrixBlock("", &blocks[j]);
+		currBlocks = infiniteDmrgStep(currBlocks, thisStepBlocksNum, thisStepBasisSize, &nextStepBlocksNum, &nextStepBasisSize);
+		allBlocks[i] = currBlocks;
+		allBlocksNums[i] = nextStepBlocksNum;
 	}
-	for (int i = 0; i < nextStepBlocksNum; i++) freeMatrixBlock(blocks + i);
-	freeMatrixBlockArr(blocks);
-	printf("matrixBlockCounter = %d, fcomplexCounter = %d, docCounter = %d, sDocCounter = %d\n", matrixBlockCounter, fcomplexCounter, docCounter, sDocCounter);
+	// Expand A on account of B 
+	for (i = LATTICE_SIZE / 2; i < LATTICE_SIZE; i++) {
+		int thisStepBlocksNum = nextStepBlocksNum;
+		int thisStepBasisSize = nextStepBasisSize;
+		int bIndex = LATTICE_SIZE - 1 - i;
+		currBlocks = finiteDmrgStep(currBlocks, thisStepBlocksNum, allBlocks[bIndex], allBlocksNums[bIndex], &nextStepBlocksNum, &nextStepBasisSize);
+		allBlocks[i+1] = currBlocks;
+		allBlocksNums[i+1] = nextStepBlocksNum;
+	} 	
+	// Expand B on account of A
+	for (i = LATTICE_SIZE - 1; i > 0; i--) {
+		int bIndex = LATTICE_SIZE - 1 - i;
+		currBlocks = finiteDmrgStep(allBlocks[bIndex], allBlocksNums[bIndex], allBlocks[i], allBlocksNums[i], &nextStepBlocksNum, &nextStepBasisSize);
+		for (int j = 0; j < allBlocksNums[bIndex + 1]; j++) freeMatrixBlock(&(allBlocks[bIndex + 1][j]));
+		freeMatrixBlockArr(allBlocks[bIndex + 1]);
+		allBlocks[bIndex + 1] = currBlocks;
+		allBlocksNums[bIndex + 1] = nextStepBlocksNum;
+	}
+	// printMatrixBlock("final", allBlocks[LATTICE_SIZE - 1]);
+
+	for (int i = 1; i < LATTICE_SIZE; i++)  {
+		for (int j = 0; j < allBlocksNums[i]; j++) {
+			freeMatrixBlock(allBlocks[i]+ j);
+		}
+	}
+	// exact();
 }
 
 // Returns the KrONEcker product of A and B.
@@ -636,12 +685,17 @@ void addSubBlock(fcomplex* M, int MRowsNum, int MColsNum, fcomplex alpha, fcompl
 
 // combines a block A with block B, assuming they share there sZ value.
 // Does not deal with sPlusLastSite member.
-void toSingleMatrixBlock(MatrixBlock* restrict A, MatrixBlock* restrict B, MatrixBlock* result) {
+void toSingleMatrixBlock(MatrixBlock* restrict A, MatrixBlock* restrict B, MatrixBlock* result, char* combineMode) {
 	int arraySize = getArraySize(A->basisSize + B->basisSize, A->basisSize + B->basisSize);
 	fcomplex* H = mallocFcomplexArr(arraySize);
 	toSingleMatrix(A->H, A->basisSize, B->H, B->basisSize, H);
-	fcomplex* sZLastSite = mallocFcomplexArr(arraySize);
-	toSingleMatrix(A->sZLastSite, A->basisSize, B->sZLastSite, B->basisSize, sZLastSite);
+	fcomplex* sZLastSite;
+	if (*combineMode == 'F' || *combineMode == 'f') {
+		sZLastSite = NULL;
+	 } else {
+	 	sZLastSite = mallocFcomplexArr(arraySize);
+		toSingleMatrix(A->sZLastSite, A->basisSize, B->sZLastSite, B->basisSize, sZLastSite);
+	}
 	*result = (MatrixBlock) {
 		.elementsNum = A->elementsNum,
 		.basisSize = A->basisSize + B->basisSize,
@@ -656,8 +710,11 @@ void toSingleMatrixBlock(MatrixBlock* restrict A, MatrixBlock* restrict B, Matri
 void copyMatrixBlock(MatrixBlock* source, MatrixBlock* dest) {
 	fcomplex* H = mallocFcomplexArr(getArraySize(source->basisSize, source->basisSize));
 	memcpy(H, source->H, sizeof(fcomplex) * getArraySize(source->basisSize, source->basisSize));
-	fcomplex* sZLastSite = mallocFcomplexArr(getArraySize(source->basisSize, source->basisSize));
-	memcpy(sZLastSite, source->sZLastSite, sizeof(fcomplex) * getArraySize(source->basisSize, source->basisSize));
+	fcomplex* sZLastSite = NULL;
+	if (source->sZLastSite != NULL) {
+		sZLastSite = mallocFcomplexArr(getArraySize(source->basisSize, source->basisSize));
+		memcpy(sZLastSite, source->sZLastSite, sizeof(fcomplex) * getArraySize(source->basisSize, source->basisSize));
+	}
 	*dest = (MatrixBlock) {
 		.elementsNum = source->elementsNum,
 		.basisSize = source->basisSize,
@@ -670,7 +727,7 @@ void copyMatrixBlock(MatrixBlock* source, MatrixBlock* dest) {
 		fcomplex* sPlusLastSite = mallocFcomplexArr(getArraySize(source->nextBlockBasisSize, source->basisSize));	
 		memcpy(sPlusLastSite, source->sPlusLastSite, sizeof(fcomplex) * getArraySize(source->nextBlockBasisSize, source->basisSize));
 		dest->sPlusLastSite = sPlusLastSite;
-		} else {
+	} else {
 		dest->sPlusLastSite = NULL;
 	}
 }
@@ -684,58 +741,20 @@ fcomplex* updateOperatorForNewBasis(fcomplex* O, int ORows, int OCols,
 	return result;
 }
 
-MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resultSize, int* resultBasisSize) {
-
-	// Add a single site to A
-	MatrixBlock* expandedBlockA;
-	int expandedBlocksNum;
-	BlockStatesDoc* expandedBlockDoc;
-	combineStates(NEW_STATE_MATRIX_BLOCK, SITE_STATES_NUM, A, ABlocksNum, &expandedBlockA, &expandedBlocksNum, &expandedBlockDoc);
-	for (int i= 0; i < expandedBlocksNum; i++)  {
-		//TODO to separate func.
-		MatrixBlock* thisBlock = &expandedBlockA[i];
-		for (int j = 0; j < expandedBlocksNum; j++) {
-			MatrixBlock* nextBlock = &expandedBlockA[j];
-			if (thisBlock->sZ == nextBlock->sZ - 1) {
-				fcomplex* sPlusLastSite;
-				int sPlusLastSiteRows, sPlusLastSiteCols;
-				getSPlusLastSite(thisBlock, &expandedBlockDoc[i], nextBlock, &expandedBlockDoc[j], 
-					NEW_STATE_MATRIX_BLOCK, &sPlusLastSite, &sPlusLastSiteRows, &sPlusLastSiteCols);
-				thisBlock->sPlusLastSite = sPlusLastSite;
-				thisBlock->nextBlockBasisSize = sPlusLastSiteRows;
-				break;
-			}
-			thisBlock->nextBlockBasisSize = 0;
-		}
-	}
-
-	// If our basis size is small enough to keep in its whole, do it.
-	int currBasisSize = ABasisSize * SITE_STATES_NUM;
-	if (currBasisSize <= D) {
-		for (int i = 0; i < ABlocksNum; i++) freeMatrixBlock(A + i);
-		freeMatrixBlockArr(A);
-		for (int i = 0; i < expandedBlocksNum; i++) freeBlockStatesDoc(expandedBlockDoc + i);
-		freeBlockStatesDocArr(expandedBlockDoc);	
-		*resultSize = expandedBlocksNum;
-		*resultBasisSize = currBasisSize;
-		return expandedBlockA;
-	}
-
-	// Combine our new expanded lattice block with an identical one.
-	MatrixBlock expandedBlockB[expandedBlocksNum];
-	for (int i = 0; i < expandedBlocksNum; i++) copyMatrixBlock(expandedBlockA + i, expandedBlockB + i);
-
+MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, MatrixBlock* B, int BBlocksNum, int* resultSize, int* resultBasisSize) {
+    
 	MatrixBlock* fullLattice;
 	int fullLaticeBlocksNum;
 	BlockStatesDoc* fullLatticeDoc;
-	combineStates(expandedBlockA, expandedBlocksNum, expandedBlockB, expandedBlocksNum, 
-		&fullLattice, &fullLaticeBlocksNum, &fullLatticeDoc);
+	combineStates(A, ABlocksNum, B, BBlocksNum,	&fullLattice, &fullLaticeBlocksNum, &fullLatticeDoc, "Full lattice");
 
 	// Diagonalize the hamiltonian of the full lattice and get the ground state (in a (reduced) psi_ij form.)
 	int groundStateBlockIndex;
 	fcomplex* groundState;
-	getGroundState(fullLattice, fullLaticeBlocksNum, fullLatticeDoc, &groundStateBlockIndex, &groundState);
-	
+	float E0;
+	getGroundState(fullLattice, fullLaticeBlocksNum, fullLatticeDoc, &groundStateBlockIndex, &groundState, &E0);
+	printf("elementsNum = %d, E0 = %f, sz = %f\n", fullLattice[0].elementsNum, E0, fullLattice[0].sZ);
+		
 	// Trace out the B sub block (using rhoA = psi*pis^dagger) and diagonalize it. 
 	// This is done for each sub block separately.
 	int subBlocksNum = fullLatticeDoc[groundStateBlockIndex].statesDocsNum;
@@ -745,8 +764,8 @@ MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resul
 	int subBlockStatesNum[subBlocksNum];
 	int fullBasisSize = 0;
 	for (int i = 0; i < subBlocksNum; i++) {
-		int AStatesNum = expandedBlockA[fullLatticeDoc[groundStateBlockIndex].statesDocs[i].ABlockIndex].basisSize;
-		int BStatesNum = expandedBlockB[fullLatticeDoc[groundStateBlockIndex].statesDocs[i].BBlockIndex].basisSize;
+		int AStatesNum = A[fullLatticeDoc[groundStateBlockIndex].statesDocs[i].ABlockIndex].basisSize;
+		int BStatesNum = B[fullLatticeDoc[groundStateBlockIndex].statesDocs[i].BBlockIndex].basisSize;
 		fcomplex* rhoA = mallocFcomplexArr(getArraySize(AStatesNum, AStatesNum));
 		multiplyMatrices(groundState + currIndex, AStatesNum, BStatesNum, "N", groundState + currIndex, AStatesNum, BStatesNum, "D", rhoA);
 		getDensityMatrixEigenVectors(rhoA, AStatesNum, &eigenvalues[i]);
@@ -756,7 +775,7 @@ MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resul
 		fullBasisSize += AStatesNum;
 	}
 	freeFcomplexArr(groundState);
-
+	
 	// We take the D states with the highest eigenvalues for rhoA.
 	int newBasisSize = fullBasisSize < D ? fullBasisSize : D;
 	int currEigenvector[subBlocksNum];
@@ -772,7 +791,7 @@ MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resul
 		}
 		currEigenvector[largestEigenvalueBlock]--;
 	}
-
+	
 	// After deciding which are the RDM eigenvectors we will keep, update the blocks and return.
 	MatrixBlock* result = mallocMatrixBlockArr(1);
 	*resultSize = 0;
@@ -781,27 +800,27 @@ MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resul
 		int ABlockIndex = fullLatticeDoc[groundStateBlockIndex].statesDocs[i].ABlockIndex;
 		if (currEigenvector[i] < subBlockStatesNum[i] - 1) { // We are using more than 0 vectors from this subblock.
 			int basisSize = subBlockStatesNum[i] - 1 - currEigenvector[i];
-			fcomplex* basis = eigenvectors[i] + (expandedBlockA[ABlockIndex].basisSize * (currEigenvector[i] + 1));
-			fcomplex* H = updateOperatorForNewBasis(expandedBlockA[ABlockIndex].H, expandedBlockA[ABlockIndex].basisSize, expandedBlockA[ABlockIndex].basisSize, 
+			fcomplex* basis = eigenvectors[i] + (A[ABlockIndex].basisSize * (currEigenvector[i] + 1));
+			fcomplex* H = updateOperatorForNewBasis(A[ABlockIndex].H, A[ABlockIndex].basisSize, A[ABlockIndex].basisSize, 
 				basis, basisSize, basis, basisSize);
-			fcomplex* sZLastSite = updateOperatorForNewBasis(expandedBlockA[ABlockIndex].sZLastSite, expandedBlockA[ABlockIndex].basisSize, expandedBlockA[ABlockIndex].basisSize,
+			fcomplex* sZLastSite = updateOperatorForNewBasis(A[ABlockIndex].sZLastSite, A[ABlockIndex].basisSize, A[ABlockIndex].basisSize,
 				basis, basisSize, basis, basisSize);
 			result[*resultSize] = (MatrixBlock) {
-				.elementsNum = expandedBlockA[ABlockIndex].elementsNum,
+				.elementsNum = A[ABlockIndex].elementsNum,
 				.basisSize = basisSize,
  				.sZLastSite = sZLastSite,
  				.sPlusLastSite = NULL,
  				.nextBlockBasisSize = 0,
 				.H = H,
-				.sZ = expandedBlockA[ABlockIndex].sZ
+				.sZ = A[ABlockIndex].sZ
 			};
 			for (int j = 0; j < subBlocksNum; j++) {
 				int nextBlockIndex = fullLatticeDoc[groundStateBlockIndex].statesDocs[j].ABlockIndex;
-				if (expandedBlockA[ABlockIndex].sZ == expandedBlockA[nextBlockIndex].sZ - 1) {
+				if (A[ABlockIndex].sZ == A[nextBlockIndex].sZ - 1) {
 					int nextBasisSize = subBlockStatesNum[j] - 1 - currEigenvector[j];
-					fcomplex* nextBasis = eigenvectors[j] + (expandedBlockA[nextBlockIndex].basisSize * (currEigenvector[j] + 1));
-					fcomplex* sPlusLastSite = updateOperatorForNewBasis(expandedBlockA[ABlockIndex].sPlusLastSite, 
-						expandedBlockA[ABlockIndex].nextBlockBasisSize, expandedBlockA[ABlockIndex].basisSize,
+					fcomplex* nextBasis = eigenvectors[j] + (A[nextBlockIndex].basisSize * (currEigenvector[j] + 1));
+					fcomplex* sPlusLastSite = updateOperatorForNewBasis(A[ABlockIndex].sPlusLastSite, 
+						A[ABlockIndex].nextBlockBasisSize, A[ABlockIndex].basisSize,
 						nextBasis, nextBasisSize, basis, basisSize);
 					result[*resultSize].sPlusLastSite = sPlusLastSite;
 					result[*resultSize].nextBlockBasisSize = nextBasisSize;
@@ -815,86 +834,183 @@ MatrixBlock* dmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resul
 		}
 	}
 
-
-	
-	for (int i = 0; i < expandedBlocksNum; i++) freeMatrixBlock(expandedBlockA + i);
-	for (int i = 0; i < expandedBlocksNum; i++) freeMatrixBlock(expandedBlockB + i);
-	for (int i = 0; i < expandedBlocksNum; i++) freeBlockStatesDoc(expandedBlockDoc + i);
-	for (int i = 0; i < ABlocksNum; i++) freeMatrixBlock(A + i);
 	for (int i = 0; i < fullLaticeBlocksNum; i++) freeMatrixBlock(fullLattice + i);
 	for (int i = 0; i < fullLaticeBlocksNum; i++) freeBlockStatesDoc(fullLatticeDoc + i);
 	for (int i = 0; i < subBlocksNum; i++) freeFcomplexArr(eigenvectors[i]); 
 	for (int i = 0; i < subBlocksNum; i++) freeFlaotArr(eigenvalues[i]);
-	freeMatrixBlockArr(A);
-	freeBlockStatesDocArr(expandedBlockDoc);
 	freeBlockStatesDocArr(fullLatticeDoc);
-	freeMatrixBlockArr(expandedBlockA);
 	freeMatrixBlockArr(fullLattice);
+
+	return result;
+}
+
+void addSiteToBlock(MatrixBlock* restrict A, int ABlocksNum, 
+		MatrixBlock** result, int* resultSize, BlockStatesDoc** doc) {
+	combineStates(NEW_STATE_MATRIX_BLOCK, SITE_STATES_NUM, A, ABlocksNum, result, resultSize, doc, "Expansion");
+	for (int i = 0; i < *resultSize; i++)  {
+		//TODO to separate func.
+		MatrixBlock* thisBlock = &(*result)[i];
+		for (int j = 0; j < *resultSize; j++) {
+			MatrixBlock* nextBlock = &(*result)[j];
+			if (thisBlock->sZ == nextBlock->sZ - 1) {
+				fcomplex* sPlusLastSite;
+				int sPlusLastSiteRows, sPlusLastSiteCols;
+				getSPlusLastSite(thisBlock, &(*doc)[i], nextBlock, &(*doc)[j], 
+					NEW_STATE_MATRIX_BLOCK, &sPlusLastSite, &sPlusLastSiteRows, &sPlusLastSiteCols);
+				thisBlock->sPlusLastSite = sPlusLastSite;
+				thisBlock->nextBlockBasisSize = sPlusLastSiteRows;
+				break;
+			}
+			thisBlock->nextBlockBasisSize = 0;
+		}
+	}
+
+}
+
+MatrixBlock* infiniteDmrgStep(MatrixBlock* A, int ABlocksNum, int ABasisSize, int* resultSize, int* resultBasisSize) {
+	// Add a single site to A
+	MatrixBlock* expandedBlockA;
+	int expandedBlocksNum;
+	BlockStatesDoc* expandedBlockDoc;
+	addSiteToBlock(A, ABlocksNum, &expandedBlockA, &expandedBlocksNum, &expandedBlockDoc);
+
+	// If our basis size is small enough to keep in its whole, do it.
+	int currBasisSize = ABasisSize * SITE_STATES_NUM;
+	if (currBasisSize <= D) {
+		for (int i = 0; i < expandedBlocksNum; i++) freeBlockStatesDoc(expandedBlockDoc + i);
+		freeBlockStatesDocArr(expandedBlockDoc);	
+		*resultSize = expandedBlocksNum;
+		*resultBasisSize = currBasisSize;
+		return expandedBlockA;
+	}
+
+	// Combine our new expanded lattice block with an identical one.
+	MatrixBlock expandedBlockB[expandedBlocksNum];
+	for (int i = 0; i < expandedBlocksNum; i++) copyMatrixBlock(expandedBlockA + i, expandedBlockB + i);
+
+	MatrixBlock* result = dmrgStep(expandedBlockA, expandedBlocksNum, expandedBlockB, expandedBlocksNum, resultSize, resultBasisSize);
+		
+	for (int i = 0; i < expandedBlocksNum; i++) freeMatrixBlock(expandedBlockA + i);
+	for (int i = 0; i < expandedBlocksNum; i++) freeMatrixBlock(expandedBlockB + i);
+	for (int i = 0; i < expandedBlocksNum; i++) freeBlockStatesDoc(expandedBlockDoc + i);
+	freeBlockStatesDocArr(expandedBlockDoc);
+	freeMatrixBlockArr(expandedBlockA);
 	
 	return result;
  
 }
 
-void exact(int size) {
-	int basisSize = (int) pow(2, size);
-	fcomplex H[basisSize*basisSize];
-	for (int i = 0; i < basisSize; i++) {
-		for (int j = 0; j < basisSize; j++) {
-			int index = i*basisSize + j;
-			H[index] = ZERO;
-			if (i == j) {
-				int state = i;
-				for (int k = 0; k < size; k++) {
-					float sZI = (state & 1) - 0.5;
-					fcomplex c = {.re = sZI, .im = 0};
-					H[index] = add(H[index], mult(M, c));
-					float sZI1 = k < (size - 1) ? ((state & 2) / 2) - 0.5 : 0;
-					c.re *= sZI1;
-					H[index] = add(H[index], mult(JZ, c));
-					state >>= 1;
-				}
-			} else {
-				int xor = i ^ j; // We want the difference between i and j to be neighbours.
-				int xori = (xor & i); // Each state should have one up and one down. 
-				int xorj = (xor & j);
-				if (xori !=0 && xorj != 0) {
-					while (xor > 0) {
-						if (xor & 1 > 0) {
-							xor >>= 1;
-							if (xor & 1 > 0) {
-								xor >>= 1;
-								if (xor == 0) {
-									H[index] = add(H[index], JPM);
-								}
-								else xor = 0;
-							}
-							else xor = 0;
-						}
-						xor >>= 1;
-					}
-				}
-			}
-		}
-	}
-	// printMatrix("H exact", H, basisSize, basisSize);
-	float eigenvalues[basisSize];
-	fcomplex eigenVectors[(int) pow(basisSize, 2)];
-	int lwork = -1;
-    fcomplex wkopt;
-    fcomplex* work;
-    float rwork[3*basisSize - 2];
-    int info;
+MatrixBlock* finiteDmrgStep(MatrixBlock* A, int ABlocksNum, MatrixBlock* B, int BBlocksNum, int* resultSize, int* resultBasisSize) {
+	MatrixBlock* expandedBlockA;
+	int expandedBlocksNum;
+	BlockStatesDoc* expandedBlockDoc;
+	addSiteToBlock(A, ABlocksNum, &expandedBlockA, &expandedBlocksNum, &expandedBlockDoc);
+	MatrixBlock* result = dmrgStep(expandedBlockA, expandedBlocksNum, B, BBlocksNum, resultSize, resultBasisSize);
+	for (int i = 0; i < expandedBlocksNum; i++) freeMatrixBlock(expandedBlockA + i);
+	for (int i = 0; i < expandedBlocksNum; i++) freeBlockStatesDoc(expandedBlockDoc + i);
+	freeBlockStatesDocArr(expandedBlockDoc);
+	freeMatrixBlockArr(expandedBlockA);	
+	return result;
+}
 
-    cheev_( "Vectors", "Lower", &basisSize, H, &basisSize, eigenvalues, &wkopt, &lwork, rwork, &info);
-    lwork = (int)wkopt.re;
-    work = mallocFcomplexArr(lwork);
-    /* Solve eigenproblem */
-    cheev_( "Vectors", "Lower", &basisSize, H, &basisSize, eigenvalues, work, &lwork, rwork, &info);
-    /* Check for convergence */
-    if( info > 0 ) {
-       printf( "exact: cheev failed.\n" );
-       exit(1);
-    }
-    printf("E0 = %f\n", eigenvalues[0]);
-    freeFcomplexArr(work);
+int choose(int n, int k) {
+	float result = 1;
+	for (int i = 1; i <= n - k; i++) result /= i;
+	for (int i = k + 1; i <= n; i++) result *= i;
+	return (int) result;
+}
+
+void exact() {
+	// int size = LATTICE_SIZE;
+	// printf("exact solution:\n");
+	// int blocksDiv[BASIS_SIZE] = {0};
+	// int currPosition[size + 1] = {0};
+	// int c = 0;
+	// for (int i = 0; i <= size; i++) {
+	// 	currPosition[i] = c;
+	// 	c += choose(size, i);
+	// }
+	// for (int i = 0; i < BASIS_SIZE; i++) {
+	// 	int counter = 0;
+	// 	for (int state = i; state > 0; state >>= 1) counter += state & 1;
+	// 	blocksDiv[currPosition[counter]] = i;
+	// 	currPosition[counter]++;
+	// }
+	// fcomplex fullH[H_SIZE] = {0};
+	// int curr = 0;
+	// float minE = 0;
+	// float minSZ = 0;
+	// for (int currBlock = 0; currBlock <= size; currBlock++) {
+	// 	int basisSize = choose(size, currBlock);
+	// 	printf("currBlock = %d, basisSize = %d\n", currBlock, basisSize);
+	// 	fcomplex* H = H + curr;
+	// 	curr +=  
+	// 	for (int i = 0; i < basisSize; i++) {
+	// 		for (int j = 0; j < basisSize; j++) {
+	// 			int index = i*basisSize + j;
+	// 			H[index] = ZERO;
+	// 			int iState = blocksDiv[currBlock][i];
+	// 			int jState = blocksDiv[currBlock][j];
+	// 			if (iState == jState) {
+	// 				int state = iState;
+	// 				for (int k = 0; k < size; k++) {
+	// 					float sZI = (state & 1) - 0.5;
+	// 					fcomplex c = {.re = sZI, .im = 0};
+	// 					H[index] = add(H[index], mult(M, c));
+	// 					float sZI1 = k < (size - 1) ? ((state & 2) / 2) - 0.5 : 0;
+	// 					c.re *= sZI1;
+	// 					H[index] = add(H[index], mult(JZ, c));
+	// 					state >>= 1;
+	// 				}
+	// 			} else {
+	// 				int xor = iState ^ jState; // We want the difference between i and j to be neighbours.
+	// 				int xori = (xor & iState); // Each state should have one up and one down. 
+	// 				int xorj = (xor & jState);
+	// 				if (xori !=0 && xorj != 0) {
+	// 					while (xor > 0) {
+	// 						if (xor & 1 > 0) {
+	// 							xor >>= 1;
+	// 							if (xor & 1 > 0) {
+	// 								xor >>= 1;
+	// 								if (xor == 0) {
+	// 									H[index] = add(H[index], JPM);
+	// 								}
+	// 								else xor = 0;
+	// 							}
+	// 							else xor = 0;
+	// 						}
+	// 						xor >>= 1;
+	// 					}
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// 	// printMatrix("H exact", H, basisSize, basisSize);
+	// 	float eigenvalues[basisSize];
+	// 	fcomplex eigenVectors[(int) pow(basisSize, 2)];
+	// 	int lwork = -1;
+	//     fcomplex wkopt;
+	//     fcomplex* work;
+	//     float rwork[3*basisSize - 2];
+	//     int info;
+	//     cheev_( "Vectors", "Lower", &basisSize, H, &basisSize, eigenvalues, &wkopt, &lwork, rwork, &info);
+	//     lwork = (int)wkopt.re;
+	//     work = mallocFcomplexArr(lwork);
+	//     /* Solve eigenproblem */
+	//     cheev_( "Vectors", "Lower", &basisSize, H, &basisSize, eigenvalues, work, &lwork, rwork, &info);
+	//     /* Check for convergence */
+	//     if( info > 0 ) {
+	//        printf( "exact: cheev failed.\n" );
+	//        exit(1);
+	//     }
+	//     if (eigenvalues[0] < minE) {
+	//     	minE = eigenvalues[0];
+	//     	minSZ = (2* currBlock - size) * 0.5;
+	//     }
+	//     freeFcomplexArr(work);
+	// 	freeFcomplexArr(H);
+
+	// }
+	// printf("E0 = %f, sZ = %f\n", minE, minSZ);
+	// for (int i = 0; i <= size; i++) free(blocksDiv[i]);
  }
